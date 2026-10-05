@@ -3,7 +3,11 @@
 #include "Effects.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -13,10 +17,11 @@ namespace
     constexpr float Width = 800.f;
     constexpr float Height = 600.f;
     constexpr float FixedStep = 1.f / 120.f;
+    constexpr int MaximumScore = 2800;
 
     enum class State
     {
-        Ready,
+        Menu,
         Playing,
         Paused,
         Won,
@@ -31,14 +36,99 @@ namespace
         Boss
     };
 
+    const std::array<std::string, 3> DifficultyNames{
+        "Easy", "Normal", "Hard"
+    };
+
+    const std::array<int, 3> StartingHull{ 5, 3, 2 };
+    const std::array<float, 3> EnemyPace{ 0.8f, 1.f, 1.25f };
+
+    std::filesystem::path scoreFilePath()
+    {
+        std::filesystem::path base;
+
+#ifdef _WIN32
+        char* folder = nullptr;
+        std::size_t length = 0;
+
+        if (_dupenv_s(&folder, &length, "LOCALAPPDATA") == 0
+            && folder != nullptr)
+        {
+            base = folder;
+        }
+
+        std::free(folder);
+#endif
+
+        if (base.empty())
+        {
+            std::error_code error;
+            base = std::filesystem::current_path(error);
+
+            if (error)
+                base = ".";
+        }
+
+        return base / "VBTutor" / "SpaceShooter" / "highscores.txt";
+    }
+
+    std::array<int, 3> loadScores(
+        const std::filesystem::path& path)
+    {
+        std::array<int, 3> scores{ 0, 0, 0 };
+        std::array<int, 3> loaded{};
+
+        std::ifstream input(path);
+
+        if (input >> loaded[0] >> loaded[1] >> loaded[2])
+        {
+            const bool valid = std::all_of(
+                loaded.begin(),
+                loaded.end(),
+                [](int score)
+                {
+                    return score >= 0 && score <= MaximumScore;
+                });
+
+            if (valid)
+                scores = loaded;
+        }
+
+        return scores;
+    }
+
+    bool saveScores(
+        const std::filesystem::path& path,
+        const std::array<int, 3>& scores)
+    {
+        std::error_code error;
+        std::filesystem::create_directories(
+            path.parent_path(), error);
+
+        if (error)
+            return false;
+
+        std::ofstream output(path, std::ios::trunc);
+
+        if (!output)
+            return false;
+
+        for (int score : scores)
+            output << score << '\n';
+
+        output.flush();
+        return static_cast<bool>(output);
+    }
+
     struct Projectile
     {
         sf::RectangleShape shape;
         sf::Vector2f velocity;
-        bool hostile = false;
+        bool hostile;
         bool active = true;
 
-        Projectile(sf::Vector2f position,
+        Projectile(
+            sf::Vector2f position,
             sf::Vector2f speed,
             bool enemyShot)
             : velocity(speed), hostile(enemyShot)
@@ -77,7 +167,8 @@ namespace
         int hp;
         bool active = true;
 
-        Enemy(const sf::Texture& texture,
+        Enemy(
+            const sf::Texture& texture,
             EnemyKind enemyKind,
             sf::Vector2f position,
             int health,
@@ -119,7 +210,11 @@ namespace
         std::vector<Enemy> enemies;
         std::vector<Pickup> pickups;
 
-        State state = State::Ready;
+        State state = State::Menu;
+        int difficulty = 1;
+
+        std::filesystem::path scorePath = scoreFilePath();
+        std::array<int, 3> bestScores{ 0, 0, 0 };
 
         int score = 0;
         int hull = 3;
@@ -134,8 +229,10 @@ namespace
         float intermissionTimer = 0.f;
 
         bool betweenWaves = false;
+        bool saveFailed = false;
 
-        Game(const sf::Texture& playerTexture,
+        Game(
+            const sf::Texture& playerTexture,
             const sf::Texture& enemyShipTexture)
             : player(playerTexture),
             enemyTexture(enemyShipTexture)
@@ -143,6 +240,8 @@ namespace
             player.setOrigin({ 12.f, 12.f });
             player.setScale({ 2.f, 2.f });
             player.setPosition({ 400.f, 540.f });
+
+            bestScores = loadScores(scorePath);
         }
     };
 
@@ -152,16 +251,15 @@ namespace
 
         for (unsigned int y = 2; y < 22; ++y)
         {
-            const int halfWidth =
-                static_cast<int>(y) / 2;
+            const int halfWidth = static_cast<int>(y) / 2;
 
             for (unsigned int x = 0; x < 24; ++x)
             {
-                const int distance =
-                    std::abs(static_cast<int>(x) - 12);
-
-                if (distance <= halfWidth)
+                if (std::abs(static_cast<int>(x) - 12)
+                    <= halfWidth)
+                {
                     image.setPixel({ x, y }, colour);
+                }
             }
         }
 
@@ -177,10 +275,9 @@ namespace
         return image;
     }
 
-    void resetGame(Game& game)
+    void clearRun(Game& game)
     {
         game.effects.reset();
-
         game.projectiles.clear();
         game.enemies.clear();
         game.pickups.clear();
@@ -188,9 +285,8 @@ namespace
         game.player.setPosition({ 400.f, 540.f });
         game.player.setColor(sf::Color::White);
 
-        game.state = State::Ready;
         game.score = 0;
-        game.hull = 3;
+        game.hull = StartingHull[game.difficulty];
         game.weapon = 0;
         game.wave = 1;
         game.spawned = 0;
@@ -203,9 +299,38 @@ namespace
         game.betweenWaves = false;
     }
 
+    void startGame(Game& game)
+    {
+        clearRun(game);
+        game.state = State::Playing;
+    }
+
+    void returnToMenu(Game& game)
+    {
+        clearRun(game);
+        game.state = State::Menu;
+    }
+
+    void finishGame(Game& game, State result)
+    {
+        if (game.state != State::Playing)
+            return;
+
+        game.state = result;
+
+        int& best = game.bestScores[game.difficulty];
+
+        if (game.score > best)
+        {
+            best = game.score;
+            game.saveFailed =
+                !saveScores(game.scorePath, game.bestScores);
+        }
+    }
+
     void firePlayer(Game& game)
     {
-        const sf::Vector2f muzzle =
+        const auto muzzle =
             game.player.getPosition() + sf::Vector2f{ 0.f, -30.f };
 
         if (game.weapon == 0)
@@ -215,24 +340,20 @@ namespace
         }
         else if (game.weapon == 1)
         {
-            game.projectiles.emplace_back(
-                muzzle + sf::Vector2f{ -9.f, 0.f },
-                sf::Vector2f{ 0.f, -650.f },
-                false);
-
-            game.projectiles.emplace_back(
-                muzzle + sf::Vector2f{ 9.f, 0.f },
-                sf::Vector2f{ 0.f, -650.f },
-                false);
+            for (float offset : {-9.f, 9.f})
+            {
+                game.projectiles.emplace_back(
+                    muzzle + sf::Vector2f{ offset, 0.f },
+                    sf::Vector2f{ 0.f, -650.f },
+                    false);
+            }
         }
         else
         {
             game.projectiles.emplace_back(
                 muzzle, sf::Vector2f{ -180.f, -620.f }, false);
-
             game.projectiles.emplace_back(
                 muzzle, sf::Vector2f{ 0.f, -650.f }, false);
-
             game.projectiles.emplace_back(
                 muzzle, sf::Vector2f{ 180.f, -620.f }, false);
         }
@@ -252,7 +373,7 @@ namespace
         game.protection = 1.f;
 
         if (game.hull <= 0)
-            game.state = State::GameOver;
+            finishGame(game, State::GameOver);
     }
 
     int plannedEnemies(const Game& game)
@@ -298,22 +419,20 @@ namespace
         {
             const int pattern = game.spawned % 3;
 
-            EnemyKind kind = EnemyKind::Straight;
-
-            if (pattern == 1)
-                kind = EnemyKind::Sine;
-            else if (pattern == 2)
-                kind = EnemyKind::Chase;
-
-            const float x =
-                140.f + static_cast<float>(pattern) * 260.f;
+            const EnemyKind kind =
+                pattern == 0 ? EnemyKind::Straight
+                : pattern == 1 ? EnemyKind::Sine
+                : EnemyKind::Chase;
 
             game.enemies.emplace_back(
                 game.enemyTexture,
                 kind,
-                sf::Vector2f{ x, -30.f },
-                game.wave == 1 ? 1 : 2,
-                55.f + static_cast<float>(game.wave) * 10.f);
+                sf::Vector2f{
+                    140.f + static_cast<float>(pattern) * 260.f,
+                    -30.f },
+                    game.wave == 1 ? 1 : 2,
+                    (55.f + static_cast<float>(game.wave) * 10.f)
+                    * EnemyPace[game.difficulty]);
         }
 
         ++game.spawned;
@@ -322,6 +441,8 @@ namespace
 
     void updateEnemies(Game& game, float dt)
     {
+        const float pace = EnemyPace[game.difficulty];
+
         for (auto& enemy : game.enemies)
         {
             if (!enemy.active)
@@ -335,7 +456,7 @@ namespace
             if (enemy.kind == EnemyKind::Boss)
             {
                 position.x =
-                    400.f + std::sin(enemy.age * 1.5f) * 250.f;
+                    400.f + std::sin(enemy.age * 1.5f * pace) * 250.f;
                 position.y = 80.f;
             }
             else
@@ -344,9 +465,8 @@ namespace
 
                 if (enemy.kind == EnemyKind::Sine)
                 {
-                    position.x =
-                        enemy.anchorX
-                        + std::sin(enemy.age * 2.f) * 70.f;
+                    position.x = enemy.anchorX
+                        + std::sin(enemy.age * 2.f * pace) * 70.f;
                 }
                 else if (enemy.kind == EnemyKind::Chase)
                 {
@@ -354,7 +474,9 @@ namespace
                         game.player.getPosition().x - position.x;
 
                     position.x += std::clamp(
-                        difference, -90.f * dt, 90.f * dt);
+                        difference,
+                        -90.f * pace * dt,
+                        90.f * pace * dt);
                 }
 
                 position.x =
@@ -363,9 +485,8 @@ namespace
 
             enemy.sprite.setPosition(position);
 
-            if (position.y <= 0.f ||
-                position.y >= 300.f ||
-                enemy.fireTimer > 0.f)
+            if (position.y <= 0.f || position.y >= 300.f
+                || enemy.fireTimer > 0.f)
             {
                 continue;
             }
@@ -376,54 +497,60 @@ namespace
                     position + sf::Vector2f{ 0.f, 57.f };
 
                 game.projectiles.emplace_back(
-                    muzzle, sf::Vector2f{ -120.f, 240.f }, true);
+                    muzzle,
+                    sf::Vector2f{ -120.f, 240.f } * pace,
+                    true);
 
                 game.projectiles.emplace_back(
-                    muzzle, sf::Vector2f{ 0.f, 260.f }, true);
+                    muzzle,
+                    sf::Vector2f{ 0.f, 260.f } * pace,
+                    true);
 
                 game.projectiles.emplace_back(
-                    muzzle, sf::Vector2f{ 120.f, 240.f }, true);
+                    muzzle,
+                    sf::Vector2f{ 120.f, 240.f } * pace,
+                    true);
 
-                enemy.fireTimer = 0.9f;
+                enemy.fireTimer = 0.9f / pace;
             }
             else
             {
                 game.projectiles.emplace_back(
                     position + sf::Vector2f{ 0.f, 33.f },
-                    sf::Vector2f{ 0.f, 240.f },
+                    sf::Vector2f{ 0.f, 240.f } * pace,
                     true);
 
-                enemy.fireTimer = 1.8f;
+                enemy.fireTimer = 1.8f / pace;
             }
         }
     }
 
     void updateProjectiles(Game& game, float dt)
     {
-        for (auto& projectile : game.projectiles)
+        for (auto& shot : game.projectiles)
         {
-            if (!projectile.active)
+            if (!shot.active)
                 continue;
 
-            projectile.shape.move(projectile.velocity * dt);
+            shot.shape.move(shot.velocity * dt);
 
-            const auto bounds = projectile.shape.getGlobalBounds();
+            const auto bounds = shot.shape.getGlobalBounds();
 
-            if (bounds.position.y + bounds.size.y < 0.f ||
-                bounds.position.y > Height ||
-                bounds.position.x + bounds.size.x < 0.f ||
-                bounds.position.x > Width)
+            if (bounds.position.y + bounds.size.y < 0.f
+                || bounds.position.y > Height
+                || bounds.position.x + bounds.size.x < 0.f
+                || bounds.position.x > Width)
             {
-                projectile.active = false;
+                shot.active = false;
             }
         }
     }
 
     void checkHits(Game& game)
     {
-        for (auto& projectile : game.projectiles)
+        for (auto& shot : game.projectiles)
         {
-            if (!projectile.active || projectile.hostile)
+            if (!shot.active || shot.hostile)
                 continue;
 
             for (auto& enemy : game.enemies)
@@ -431,13 +558,13 @@ namespace
                 if (!enemy.active)
                     continue;
 
-                if (!projectile.shape.getGlobalBounds()
-                    .findIntersection(enemy.sprite.getGlobalBounds()))
+                if (!shot.shape.getGlobalBounds().findIntersection(
+                    enemy.sprite.getGlobalBounds()))
                 {
                     continue;
                 }
 
-                projectile.active = false;
+                shot.active = false;
                 --enemy.hp;
 
                 if (enemy.hp <= 0)
@@ -467,18 +594,18 @@ namespace
             }
         }
 
-        for (auto& projectile : game.projectiles)
+        for (auto& shot : game.projectiles)
         {
             if (game.state != State::Playing)
                 break;
 
-            if (!projectile.active || !projectile.hostile)
+            if (!shot.active || !shot.hostile)
                 continue;
 
-            if (projectile.shape.getGlobalBounds()
-                .findIntersection(game.player.getGlobalBounds()))
+            if (shot.shape.getGlobalBounds().findIntersection(
+                game.player.getGlobalBounds()))
             {
-                projectile.active = false;
+                shot.active = false;
                 damagePlayer(game);
             }
         }
@@ -493,14 +620,9 @@ namespace
 
             const auto bounds = enemy.sprite.getGlobalBounds();
 
-            const bool touchingPlayer =
-                bounds.findIntersection(
-                    game.player.getGlobalBounds()).has_value();
-
-            const bool escaped =
-                bounds.position.y > Height;
-
-            if (touchingPlayer || escaped)
+            if (bounds.findIntersection(
+                game.player.getGlobalBounds())
+                || bounds.position.y > Height)
             {
                 enemy.active = false;
                 damagePlayer(game);
@@ -517,15 +639,15 @@ namespace
 
             pickup.shape.move({ 0.f, 140.f * dt });
 
-            if (pickup.shape.getGlobalBounds()
-                .findIntersection(game.player.getGlobalBounds()))
+            if (pickup.shape.getGlobalBounds().findIntersection(
+                game.player.getGlobalBounds()))
             {
                 game.effects.pickup(pickup.shape.getPosition());
-
                 game.weapon = std::min(2, game.weapon + 1);
                 pickup.active = false;
             }
-            else if (pickup.shape.getGlobalBounds().position.y > Height)
+            else if (pickup.shape.getGlobalBounds().position.y
+                 > Height)
             {
                 pickup.active = false;
             }
@@ -538,9 +660,9 @@ namespace
             std::remove_if(
                 game.projectiles.begin(),
                 game.projectiles.end(),
-                [](const Projectile& projectile)
+                [](const Projectile& shot)
                 {
-                    return !projectile.active;
+                    return !shot.active;
                 }),
             game.projectiles.end());
 
@@ -577,19 +699,16 @@ namespace
 
         if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Left))
             direction.x -= 1.f;
-
         if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Right))
             direction.x += 1.f;
-
         if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Up))
             direction.y -= 1.f;
-
         if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Down))
             direction.y += 1.f;
 
-        const float length =
-            std::sqrt(direction.x * direction.x
-                + direction.y * direction.y);
+        const float length = std::sqrt(
+            direction.x * direction.x
+            + direction.y * direction.y);
 
         if (length > 0.f)
             direction /= length;
@@ -597,17 +716,15 @@ namespace
         game.player.move(direction * 360.f * dt);
 
         auto position = game.player.getPosition();
-
         position.x = std::clamp(position.x, 24.f, Width - 24.f);
         position.y = std::clamp(position.y, 330.f, Height - 24.f);
-
         game.player.setPosition(position);
 
         updateSpawning(game, dt);
 
-        if (!game.betweenWaves &&
-            sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Space) &&
-            game.fireCooldown <= 0.f)
+        if (!game.betweenWaves
+            && sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Space)
+            && game.fireCooldown <= 0.f)
         {
             firePlayer(game);
             game.fireCooldown = 0.18f;
@@ -622,16 +739,16 @@ namespace
 
         removeInactive(game);
 
-        if (game.state == State::Playing &&
-            !game.betweenWaves &&
-            game.spawned == plannedEnemies(game) &&
-            game.enemies.empty())
+        if (game.state == State::Playing
+            && !game.betweenWaves
+            && game.spawned == plannedEnemies(game)
+            && game.enemies.empty())
         {
             game.projectiles.clear();
 
             if (game.wave == 4)
             {
-                game.state = State::Won;
+                finishGame(game, State::Won);
             }
             else
             {
@@ -641,96 +758,237 @@ namespace
         }
     }
 
-    void updateTitle(sf::RenderWindow& window, const Game& game)
+    void drawText(
+        sf::RenderTarget& target,
+        const sf::Font& font,
+        const std::string& message,
+        unsigned int size,
+        float x,
+        float y,
+        sf::Color colour = sf::Color::White,
+        bool centred = false)
     {
-        std::string title =
-            "SpaceShooter | Score: " + std::to_string(game.score)
-            + " | Hull: " + std::to_string(game.hull)
-            + " | Wave: " + std::to_string(game.wave) + "/4"
-            + " | Weapon: " + std::to_string(game.weapon + 1);
+        sf::Text text(font);
+        text.setString(message);
+        text.setCharacterSize(size);
+        text.setFillColor(colour);
 
-        for (const auto& enemy : game.enemies)
+        if (centred)
         {
-            if (enemy.active && enemy.kind == EnemyKind::Boss)
+            const auto bounds = text.getLocalBounds();
+            text.setOrigin({
+                bounds.position.x + bounds.size.x / 2.f,
+                bounds.position.y + bounds.size.y / 2.f });
+        }
+
+        text.setPosition({ x, y });
+        target.draw(text);
+    }
+
+    void drawPanel(sf::RenderTarget& target)
+    {
+        sf::RectangleShape panel({ Width, Height });
+        panel.setFillColor(sf::Color(0, 0, 0, 185));
+        target.draw(panel);
+    }
+
+    void drawInterface(
+        sf::RenderWindow& window,
+        const sf::Font& font,
+        const Game& game)
+    {
+        const auto cyan = sf::Color(100, 230, 255);
+
+        if (game.state == State::Menu)
+        {
+            drawPanel(window);
+
+            drawText(window, font, "SPACE SHOOTER",
+                48, 400.f, 105.f, cyan, true);
+
+            drawText(window, font, "Select difficulty",
+                24, 400.f, 185.f, sf::Color::White, true);
+
+            for (int i = 0; i < 3; ++i)
             {
-                title += " | Boss HP: " + std::to_string(enemy.hp);
+                const bool selected = i == game.difficulty;
+
+                const std::string label =
+                    (selected ? "> " : "  ")
+                    + std::to_string(i + 1) + ": "
+                    + DifficultyNames[i]
+                    + "   Best: " + std::to_string(game.bestScores[i]);
+
+                drawText(
+                    window, font, label, 24,
+                    400.f, 230.f + static_cast<float>(i) * 42.f,
+                    selected ? cyan : sf::Color(180, 180, 190),
+                    true);
+            }
+
+            drawText(window, font, "Enter: Start",
+                28, 400.f, 390.f, sf::Color::White, true);
+
+            drawText(window, font, "Arrows: Move    Space: Fire",
+                20, 400.f, 445.f, sf::Color::White, true);
+
+            drawText(window, font, "P: Pause    M: Menu    Escape: Exit",
+                20, 400.f, 480.f, sf::Color::White, true);
+        }
+        else
+        {
+            sf::RectangleShape hud({ Width, 42.f });
+            hud.setFillColor(sf::Color(0, 0, 0, 190));
+            window.draw(hud);
+
+            drawText(
+                window, font,
+                "Score: " + std::to_string(game.score),
+                19, 12.f, 8.f);
+
+            drawText(
+                window, font,
+                "Hull: " + std::to_string(game.hull),
+                19, 185.f, 8.f);
+
+            drawText(
+                window, font,
+                "Weapon: " + std::to_string(game.weapon + 1),
+                19, 290.f, 8.f);
+
+            drawText(
+                window, font,
+                "Wave: " + std::to_string(game.wave) + "/4",
+                19, 445.f, 8.f);
+
+            drawText(
+                window, font,
+                "Best: "
+                + std::to_string(game.bestScores[game.difficulty]),
+                19, 610.f, 8.f);
+
+            for (const auto& enemy : game.enemies)
+            {
+                if (!enemy.active || enemy.kind != EnemyKind::Boss)
+                    continue;
+
+                sf::RectangleShape background({ 300.f, 12.f });
+                background.setPosition({ 250.f, 48.f });
+                background.setFillColor(sf::Color(60, 30, 50));
+                window.draw(background);
+
+                sf::RectangleShape health({
+                    300.f * std::clamp(
+                        static_cast<float>(enemy.hp) / 12.f,
+                        0.f, 1.f),
+                    12.f });
+
+                health.setPosition({ 250.f, 48.f });
+                health.setFillColor(sf::Color(255, 90, 180));
+                window.draw(health);
                 break;
+            }
+
+            if (game.state == State::Playing && game.betweenWaves)
+            {
+                drawText(
+                    window, font, "NEXT WAVE APPROACHING",
+                    28, 400.f, 260.f, cyan, true);
+            }
+
+            if (game.state == State::Paused)
+            {
+                drawPanel(window);
+
+                drawText(window, font, "PAUSED",
+                    44, 400.f, 240.f, cyan, true);
+
+                drawText(window, font, "P: Resume    M: Menu",
+                    24, 400.f, 310.f, sf::Color::White, true);
+            }
+
+            if (game.state == State::Won
+                || game.state == State::GameOver)
+            {
+                drawPanel(window);
+
+                drawText(
+                    window, font,
+                    game.state == State::Won
+                    ? "MISSION COMPLETE"
+                    : "GAME OVER",
+                    42, 400.f, 210.f, cyan, true);
+
+                drawText(
+                    window, font,
+                    "Score: " + std::to_string(game.score),
+                    28, 400.f, 285.f, sf::Color::White, true);
+
+                drawText(
+                    window, font,
+                    DifficultyNames[game.difficulty]
+                    + " best: "
+                    + std::to_string(
+                        game.bestScores[game.difficulty]),
+                    24, 400.f, 330.f, sf::Color::White, true);
+
+                drawText(
+                    window, font, "Enter: Play again    M: Menu",
+                    22, 400.f, 405.f, sf::Color::White, true);
             }
         }
 
-        switch (game.state)
+        if (game.saveFailed)
         {
-        case State::Ready:
-            title += " | Press Enter to start";
-            break;
-
-        case State::Playing:
-            if (game.betweenWaves)
-                title += " | Next wave approaching";
-            else
-                title += " | Arrows: move | Space: fire | P: pause";
-            break;
-
-        case State::Paused:
-            title += " | PAUSED - Press P to resume";
-            break;
-
-        case State::Won:
-            title += " | VICTORY! Enter: reset";
-            break;
-
-        case State::GameOver:
-            title += " | GAME OVER - Enter: reset";
-            break;
+            drawText(
+                window, font, "High score could not be saved.",
+                18, 400.f, 565.f,
+                sf::Color(255, 160, 100), true);
         }
-
-        window.setTitle(title);
     }
 
-    void drawGame(sf::RenderWindow& window, Game& game)
+    void drawGame(
+        sf::RenderWindow& window,
+        const sf::Font& font,
+        Game& game)
     {
         window.clear(sf::Color(5, 8, 20));
-
         game.effects.drawBackground(window);
 
-        for (const auto& projectile : game.projectiles)
+        if (game.state != State::Menu)
         {
-            if (projectile.active)
-                window.draw(projectile.shape);
+            for (const auto& shot : game.projectiles)
+            {
+                if (shot.active)
+                    window.draw(shot.shape);
+            }
+
+            for (const auto& enemy : game.enemies)
+            {
+                if (enemy.active)
+                    window.draw(enemy.sprite);
+            }
+
+            for (const auto& pickup : game.pickups)
+            {
+                if (pickup.active)
+                    window.draw(pickup.shape);
+            }
+
+            sf::Color colour = sf::Color::White;
+
+            if (game.protection > 0.f
+                && static_cast<int>(game.protection * 12.f) % 2 == 0)
+            {
+                colour.a = 90;
+            }
+
+            game.player.setColor(colour);
+            window.draw(game.player);
         }
-
-        for (const auto& enemy : game.enemies)
-        {
-            if (enemy.active)
-                window.draw(enemy.sprite);
-        }
-
-        for (const auto& pickup : game.pickups)
-        {
-            if (pickup.active)
-                window.draw(pickup.shape);
-        }
-
-        sf::Color playerColour = sf::Color::White;
-
-        if (game.protection > 0.f &&
-            static_cast<int>(game.protection * 12.f) % 2 == 0)
-        {
-            playerColour.a = 90;
-        }
-
-        game.player.setColor(playerColour);
-        window.draw(game.player);
 
         game.effects.drawParticles(window);
-
-        if (game.state != State::Playing)
-        {
-            sf::RectangleShape overlay({ Width, Height });
-            overlay.setFillColor(sf::Color(0, 0, 0, 90));
-            window.draw(overlay);
-        }
-
+        drawInterface(window, font, game);
         window.display();
     }
 } // namespace
@@ -745,12 +1003,27 @@ int main()
     window.setVerticalSyncEnabled(true);
     window.setKeyRepeatEnabled(false);
 
+    const auto fontPath =
+        std::filesystem::path(GAME_ASSET_DIR)
+        / "fonts" / "welcome.ttf";
+
+    sf::Font font;
+
+    if (!font.openFromFile(fontPath))
+    {
+        std::cerr
+            << "Unable to load the font.\n"
+            << "Expected location: " << fontPath << '\n'
+            << "Copy a real font file into this location.\n";
+        return 1;
+    }
+
     sf::Texture playerTexture;
     sf::Texture enemyTexture;
 
     if (!playerTexture.loadFromImage(
-        makeShipImage(sf::Color(80, 210, 255), false)) ||
-        !enemyTexture.loadFromImage(
+        makeShipImage(sf::Color(80, 210, 255), false))
+        || !enemyTexture.loadFromImage(
             makeShipImage(sf::Color(255, 110, 90), true)))
     {
         std::cerr << "Unable to create ship textures.\n";
@@ -761,11 +1034,10 @@ int main()
 
     sf::Clock clock;
     float accumulator = 0.f;
-    bool timingReset = false;
 
     while (window.isOpen())
     {
-        timingReset = false;
+        bool resetTiming = false;
 
         while (const auto event = window.pollEvent())
         {
@@ -775,47 +1047,61 @@ int main()
                 continue;
             }
 
-            if (event->is<sf::Event::FocusLost>() &&
-                game.state == State::Playing)
+            if (event->is<sf::Event::FocusLost>()
+                && game.state == State::Playing)
             {
                 game.state = State::Paused;
-                timingReset = true;
+                resetTiming = true;
             }
 
-            if (const auto* key =
-                event->getIf<sf::Event::KeyPressed>())
+            const auto* key =
+                event->getIf<sf::Event::KeyPressed>();
+
+            if (!key)
+                continue;
+
+            if (key->code == sf::Keyboard::Key::Escape)
             {
-                if (key->code == sf::Keyboard::Key::Escape)
-                {
-                    window.close();
-                }
+                window.close();
+            }
+            else if (key->code == sf::Keyboard::Key::M)
+            {
+                returnToMenu(game);
+                resetTiming = true;
+            }
+            else if (game.state == State::Menu)
+            {
+                if (key->code == sf::Keyboard::Key::Num1)
+                    game.difficulty = 0;
+                else if (key->code == sf::Keyboard::Key::Num2)
+                    game.difficulty = 1;
+                else if (key->code == sf::Keyboard::Key::Num3)
+                    game.difficulty = 2;
                 else if (key->code == sf::Keyboard::Key::Enter)
                 {
-                    if (game.state == State::Ready)
-                    {
-                        game.state = State::Playing;
-                        timingReset = true;
-                    }
-                    else if (game.state == State::Won ||
-                        game.state == State::GameOver)
-                    {
-                        resetGame(game);
-                        timingReset = true;
-                    }
+                    startGame(game);
+                    resetTiming = true;
                 }
-                else if (key->code == sf::Keyboard::Key::P)
+            }
+            else if (key->code == sf::Keyboard::Key::Enter
+                && (game.state == State::Won
+                    || game.state == State::GameOver))
+            {
+                startGame(game);
+                resetTiming = true;
+            }
+            else if (key->code == sf::Keyboard::Key::P)
+            {
+                if (game.state == State::Playing)
                 {
-                    if (game.state == State::Playing)
-                    {
-                        game.state = State::Paused;
-                        timingReset = true;
-                    }
-                    else if (game.state == State::Paused &&
-                        window.hasFocus())
-                    {
-                        game.state = State::Playing;
-                        timingReset = true;
-                    }
+                    game.state = State::Paused;
+                    resetTiming = true;
+                }
+                else if (game.state == State::Paused
+                    && window.hasFocus())
+                {
+                    game.state = State::Playing;
+                    resetTiming = true;
                 }
             }
         }
@@ -828,7 +1114,7 @@ int main()
         float elapsed =
             std::min(clock.restart().asSeconds(), 0.1f);
 
-        if (timingReset)
+        if (resetTiming)
         {
             elapsed = 0.f;
             accumulator = 0.f;
@@ -847,15 +1133,12 @@ int main()
                 if (game.state == State::Playing)
                     updateGame(game, FixedStep);
 
-                // Continue explosions on the result screens.
                 game.effects.update(FixedStep);
-
                 accumulator -= FixedStep;
             }
         }
 
-        updateTitle(window, game);
-        drawGame(window, game);
+        drawGame(window, font, game);
     }
 
     return 0;
